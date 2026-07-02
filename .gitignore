@@ -20,6 +20,9 @@ pnpm-debug.log*
 # Firebase
 .firebase
 
+# Claude Code (local tooling — permissions, task locks)
+.claude/
+
 # Editor / OS
 .vscode/*
 !.vscode/extensions.json

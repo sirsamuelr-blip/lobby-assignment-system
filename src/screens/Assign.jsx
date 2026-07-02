@@ -2,8 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { db } from '../firebase'
 import { getAllWorkers } from '../lib/workers'
 import { getWeeklyCounts } from '../lib/counts'
-import { createAssignment } from '../lib/assignments'
-import { PROGRAM_LABELS } from '../lib/selection'
+import { createAssignment, reassignAssignment } from '../lib/assignments'
+import { PROGRAM_LABELS, eligibleWorkers } from '../lib/selection'
 import { formatTicket } from '../lib/tickets'
 import {
   getPendingIds,
@@ -14,7 +14,7 @@ import {
   PENDING_TTL_MS,
 } from '../lib/pending'
 import { getTempUnavailableIds, markTempUnavailable } from '../lib/unavailable'
-import { getDevClerkId } from '../lib/devClerk'
+import { getSupervisorUnavailableIds } from '../lib/supervisorUnavailability'
 
 const PROGRAMS = ['snap', 'tanf', 'mepd', 'medicaid']
 
@@ -40,7 +40,12 @@ const formatRemaining = (ms) => {
   return `${m}m ${String(s).padStart(2, '0')}s left`
 }
 
-export default function Assign() {
+// Read a worker's weekly count from whatever getWeeklyCounts returns (a Map) —
+// tolerant of a plain object too. Missing worker → 0.
+const weeklyCountOf = (counts, id) =>
+  counts instanceof Map ? counts.get(id) ?? 0 : counts?.[id] ?? 0
+
+export default function Assign({ clerkId }) {
   // Roster is static for a session; load once.
   const [workers, setWorkers] = useState(null)
   const [rosterError, setRosterError] = useState('')
@@ -67,7 +72,23 @@ export default function Assign() {
   const [copied, setCopied] = useState(false)
 
   // Confirmation of the last completed assignment
-  const [lastAssigned, setLastAssigned] = useState(null) // {ticket, workerName, programsLabel}
+  const [lastAssigned, setLastAssigned] = useState(null) // {ticket, assignmentId, workerName, fromWorkerId, programs, programsLabel, manual, reassigned}
+
+  // Reassign (Phase 6b) — corrects a wrong-worker Assign on the green confirmation
+  // card. Fully SEPARATE from the suggestion machinery: it never touches
+  // activeClaim / suggestion / runningRef / suggestSeq / rerunRef. A completed case
+  // has no active claim, and a reassign re-attributes the EXISTING assignment doc
+  // rather than making a new claim, so its busy/picker/error state lives on its own.
+  const [reassigning, setReassigning] = useState(false)
+  const [reassignOptions, setReassignOptions] = useState(null) // null=loading | [] | [{worker,count}]
+  const [reassignBusy, setReassignBusy] = useState(false)
+  const [reassignError, setReassignError] = useState('')
+  // Reassign's OWN generation guard — deliberately separate from the suggestion
+  // machinery's suggestSeq (guardrail: keep reassign fully independent). Bumped
+  // whenever the reassign context changes (a new open, a new/cleared card), so a
+  // slow openReassign read for a PRIOR card can't overwrite the current card's
+  // picker with advisors ineligible for the current case.
+  const reassignSeq = useRef(0)
 
   // Mark-unavailable reason picker (collapsed by default). `otherOpen` reveals the
   // free-text staffing note; `otherReason` holds it. All three reset whenever the
@@ -75,6 +96,13 @@ export default function Assign() {
   const [markingUnavailable, setMarkingUnavailable] = useState(false)
   const [otherOpen, setOtherOpen] = useState(false)
   const [otherReason, setOtherReason] = useState('')
+
+  // Manual-override picker (collapsed by default; mirrors the reason picker).
+  // `overrideOptions` is null while its fresh eligibility read is in flight, then
+  // an array of { worker, count } rows to choose from. Both reset when the
+  // suggestion changes (see the [suggestion] effect below).
+  const [overriding, setOverriding] = useState(false)
+  const [overrideOptions, setOverrideOptions] = useState(null)
 
   // ~1s clock so the pending countdown moves and an untouched claim can auto
   // re-suggest at expiry. Cosmetic only — the real release is the server-side
@@ -102,6 +130,11 @@ export default function Assign() {
   // the EXACT reclaimed worker, not a fresh pick against possibly-shifted counts).
   const reconstructedRef = useRef(false)
   const skipNextResuggestRef = useRef(false)
+  // Whether the CURRENT suggestion is a manual override (a clerk-chosen worker)
+  // rather than the system's automatic pick. Read at Assign time to flag the
+  // assignment doc manual:true. A ref (not state) so it can't lag the claim it
+  // describes: every AUTO commit resets it to false; only overrideTo sets it true.
+  const manualRef = useRef(false)
 
   // Set the active claim and its mirror ref in the SAME statement, so the ref is
   // synchronously authoritative — no effect-tick lag. The queued rerun fired from
@@ -134,21 +167,26 @@ export default function Assign() {
   }, [])
 
   // Reload recovery: a reload wipes React state but the pending doc persists in
-  // Firestore, so THIS tab (its devClerkId survives in sessionStorage) restores
-  // its own unexpired claim rather than orphaning the worker for 10 minutes. Runs
-  // once, and restores the EXACT worker without re-deriving (counts may have moved
-  // and the clerk may already have messaged this person).
+  // Firestore, so this clerk (identified by their signed-in Firebase Auth uid,
+  // which Auth persists across reloads) restores their own unexpired claim rather
+  // than orphaning the worker for 10 minutes. Runs once, and restores the EXACT
+  // worker without re-deriving (counts may have moved and the clerk may already
+  // have messaged this person).
   useEffect(() => {
     if (!workers || reconstructedRef.current) return
     reconstructedRef.current = true
     let cancelled = false
-    getMyPendingClaim(db, getDevClerkId())
+    getMyPendingClaim(db, clerkId)
       .then((claim) => {
         if (cancelled || !claim) return
         const worker = workers.find((w) => w.id === claim.workerId)
         if (!worker) return
         // Suppress the one resuggest the selection change would otherwise trigger.
         skipNextResuggestRef.current = true
+        // The pending doc doesn't record manual-ness, so treat a restored claim as
+        // an automatic pick (default false) — worst case an override loses its flag
+        // across a reload, never the reverse.
+        manualRef.current = false
         setSelectedPrograms(new Set(claim.programs))
         setClaim({ workerId: claim.workerId, expiresAt: claim.expiresAtMs })
         setSuggestion({ ok: true, worker })
@@ -182,6 +220,7 @@ export default function Assign() {
       // queued rerun.
       suggestSeq.current++
       rerunRef.current = null
+      manualRef.current = false // no suggestion → not a manual one either
       const claim = activeClaimRef.current
       if (claim) {
         releasePending(db, claim.workerId)
@@ -206,11 +245,13 @@ export default function Assign() {
   // re-close the copy gate — copying only counts for the content on screen now.
   useEffect(() => {
     setCopied(false)
-    // A new (or cleared) suggestion → collapse the reason picker; it belonged to
-    // the previous worker.
+    // A new (or cleared) suggestion → collapse the reason picker AND the override
+    // picker; they belonged to the previous worker.
     setMarkingUnavailable(false)
     setOtherOpen(false)
     setOtherReason('')
+    setOverriding(false)
+    setOverrideOptions(null)
     if (suggestion?.ok) setMessageText(messageFor(suggestion.worker.firstName))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [suggestion])
@@ -248,6 +289,13 @@ export default function Assign() {
   function toggleProgram(p) {
     setActionError('')
     setLastAssigned(null)
+    // The confirmation card (and its reassign picker) belonged to the completed
+    // case — collapse and clear it alongside lastAssigned, and invalidate any
+    // in-flight openReassign read so it can't repopulate the picker for a stale card.
+    reassignSeq.current++
+    setReassigning(false)
+    setReassignOptions(null)
+    setReassignError('')
     setCopied(false) // the program selection changed → re-close the gate
     setSelectedPrograms((prev) => {
       const next = new Set(prev)
@@ -278,26 +326,36 @@ export default function Assign() {
     // against the new selection's labels while the fresh reads are in flight.
     setSuggestion(null)
     try {
-      const [weeklyCounts, pendingIds, tempUnavailableIds] = await Promise.all([
-        getWeeklyCounts(db),
-        getPendingIds(db),
-        getTempUnavailableIds(db),
-      ])
+      // The roster is now editable live from the Admin page, so it is a volatile
+      // pool input like counts/pending — read it fresh here too, so a worker
+      // added, retrained, or deactivated moments ago is reflected in THIS pick.
+      // (The one-time state `workers` still backs render + reload-recovery.)
+      const [freshWorkers, weeklyCounts, pendingIds, tempUnavailableIds, supervisorUnavailableIds] =
+        await Promise.all([
+          getAllWorkers(db),
+          getWeeklyCounts(db),
+          getPendingIds(db),
+          getTempUnavailableIds(db),
+          getSupervisorUnavailableIds(db),
+        ])
       // Exclude everyone pending EXCEPT our own active claim, so a re-suggest can
       // land back on the same person (claimWorker then reclaims via own-clerk).
       const excludeForSuggest = prevClaim
         ? pendingIds.filter((id) => id !== prevClaim.workerId)
         : pendingIds
       const r = await suggestAndClaim({
-        workers,
+        workers: freshWorkers,
         weeklyCounts,
         pendingIds: excludeForSuggest,
         // Temp-unavailable is a SEPARATE, global exclusion (not filtered against
         // our own claim): a worker we just marked here must NOT be re-suggested
         // for this same case — this fresh server read is exactly what excludes them.
         tempUnavailableIds,
+        // Supervisor-unavailable (WFH/PTO/special/callout) is likewise a global,
+        // date-based exclusion — never filtered against our own claim.
+        supervisorUnavailableIds,
         programs: progs,
-        clerkId: getDevClerkId(),
+        clerkId,
         claimFn: (a) => claimWorker(db, a),
       })
 
@@ -309,6 +367,9 @@ export default function Assign() {
         return
       }
 
+      // Either branch is an AUTOMATIC pick — clear the manual flag (only an
+      // explicit Override sets it true).
+      manualRef.current = false
       if (r.ok) {
         // Moved to a different worker → release the one we were holding.
         if (prevClaim && prevClaim.workerId !== r.worker.id) {
@@ -345,22 +406,39 @@ export default function Assign() {
     const worker = suggestion.worker
     const progsSnapshot = programsList
     const programsLabel = joinLabels(progsSnapshot)
+    // Snapshot the manual flag for THIS assignment before any reset can move it.
+    const manual = manualRef.current
     setBusy(true)
     setActionError('')
     let needsResuggest = false
     try {
-      const { ticket } = await createAssignment(db, {
+      const { ticket, id } = await createAssignment(db, {
         programs: progsSnapshot,
         workerId: worker.id,
-        clerkId: getDevClerkId(),
+        clerkId,
+        manual,
       })
       // Confirm, then clear for the next case (one client at a time per clerk).
       // The transaction already deleted the pending doc, so just drop the claim.
+      // Carry the doc id + who now holds it + the programs, so the confirmation
+      // card's Reassign can re-attribute THIS exact assignment (Phase 6b).
       setLastAssigned({
         ticket,
+        assignmentId: id,
         workerName: `${worker.firstName} ${worker.lastName}`,
+        fromWorkerId: worker.id,
+        programs: progsSnapshot,
         programsLabel,
+        manual,
+        reassigned: false,
       })
+      // The fresh card starts with its reassign picker collapsed; invalidate any
+      // in-flight openReassign read from the prior card.
+      reassignSeq.current++
+      setReassigning(false)
+      setReassignOptions(null)
+      setReassignError('')
+      manualRef.current = false // cleared for the next (automatic) case
       setClaim(null)
       setSelectedPrograms(new Set())
       setSuggestion(null)
@@ -420,6 +498,222 @@ export default function Assign() {
     }
   }
 
+  // Open (or refresh) the Override picker: read the SAME fresh pool inputs as
+  // resuggest, then list EVERY eligible worker (all EA levels) for the still-open
+  // case. Pending is excluded EXCEPT our own current claim, so the currently
+  // suggested worker and every other free eligible advisor appear. No claim is
+  // made here — just building the menu. `overrideOptions` stays null while in
+  // flight (renders a loading line).
+  async function openOverride() {
+    const claim = activeClaimRef.current
+    const progsSnapshot = programsList
+    if (progsSnapshot.length === 0) return
+    setOverrideOptions(null)
+    setActionError('')
+    try {
+      const [freshWorkers, weeklyCounts, pendingIds, tempUnavailableIds, supervisorUnavailableIds] =
+        await Promise.all([
+          getAllWorkers(db),
+          getWeeklyCounts(db),
+          getPendingIds(db),
+          getTempUnavailableIds(db),
+          getSupervisorUnavailableIds(db),
+        ])
+      // Keep our own claim in the list; exclude everyone else's pending claim.
+      const excludePending = pendingIds.filter((id) => id !== claim?.workerId)
+      const list = eligibleWorkers({
+        workers: freshWorkers,
+        weeklyCounts,
+        programs: progsSnapshot,
+        pendingIds: excludePending,
+        tempUnavailableIds,
+        supervisorUnavailableIds,
+      })
+      setOverrideOptions(list.map((w) => ({ worker: w, count: weeklyCountOf(weeklyCounts, w.id) })))
+    } catch (err) {
+      setActionError(err?.message ?? String(err))
+      setOverrideOptions([]) // render the empty state rather than a stuck spinner
+    }
+  }
+
+  function toggleOverride() {
+    if (busy) return
+    if (overriding) {
+      setOverriding(false)
+      return
+    }
+    setOverriding(true)
+    openOverride()
+  }
+
+  // Commit a manual override to `worker`: claim them (the SAME concurrency guard as
+  // an automatic pick), release the previous claim, and make them the active
+  // suggestion — flagged manual. This writes NO count; the +1 happens only when the
+  // clerk re-copies the message and hits Assign (createAssignment), exactly like an
+  // automatic pick.
+  //
+  // Serialized EXACTLY like resuggest (runningRef + suggestSeq + rerunRef), because
+  // program buttons stay enabled during busy: without this, a program toggle fired
+  // mid-claim would run a concurrent resuggest that claims a SECOND worker and moves
+  // activeClaimRef — and this function, holding a stale captured claim, would then
+  // release the wrong worker and orphan the other's pending doc. Holding runningRef
+  // blocks that concurrent resuggest; the seq check abandons cleanly if the
+  // selection is CLEARED mid-claim; and any queued selection CHANGE is served in the
+  // finally (which re-derives for the new selection, so a manual pick can never
+  // stick against a program set it wasn't chosen for).
+  async function overrideTo(worker) {
+    if (busy || runningRef.current) return
+    const claim = activeClaimRef.current
+    // Choosing the already-suggested worker is a no-op — just close the picker.
+    if (claim && worker.id === claim.workerId) {
+      setOverriding(false)
+      return
+    }
+    runningRef.current = true
+    const seq = ++suggestSeq.current
+    const progsSnapshot = programsList
+    setBusy(true)
+    setActionError('')
+    try {
+      const { claimed } = await claimWorker(db, {
+        workerId: worker.id,
+        clerkId,
+        programs: progsSnapshot,
+      })
+      if (seq !== suggestSeq.current) {
+        // Superseded (selection cleared mid-claim). Release what we grabbed and
+        // bail; the clearing branch already dropped the previous claim.
+        if (claimed) releasePending(db, worker.id)
+        return
+      }
+      if (!claimed) {
+        // Another clerk claimed them between listing and picking — re-list so the
+        // taken worker drops off, and let the clerk choose again. Our previous
+        // claim is untouched.
+        setActionError('That advisor was just taken — pick another.')
+        openOverride()
+        return
+      }
+      // Won the claim → release the worker we were holding (if different) and make
+      // this the active, MANUAL suggestion.
+      if (claim && claim.workerId !== worker.id) releasePending(db, claim.workerId)
+      manualRef.current = true
+      setClaim({ workerId: worker.id, expiresAt: Date.now() + PENDING_TTL_MS })
+      // The [suggestion] effect re-syncs the Teams message and re-closes the copy
+      // gate, so the clerk re-copies and Assigns this worker normally → manual:true.
+      setSuggestion({ ok: true, worker })
+      setOverriding(false)
+      setOverrideOptions(null)
+    } catch (err) {
+      if (seq === suggestSeq.current) setActionError(err?.message ?? String(err))
+    } finally {
+      if (seq === suggestSeq.current) setBusy(false)
+      runningRef.current = false
+      // A selection change queued while we claimed → serve it now: it re-derives
+      // for the new selection, releasing us if we moved and clearing manualRef.
+      const queued = rerunRef.current
+      rerunRef.current = null
+      if (queued && queued.length > 0) resuggest(queued)
+    }
+  }
+
+  // --- Reassign (Phase 6b) -------------------------------------------------
+  // Correct a wrong-worker Assign FROM the green confirmation card. This is fully
+  // separate from the suggestion flow above: no activeClaim, no suggestion, no
+  // runningRef/suggestSeq/rerunRef — a completed case has none of those, and the
+  // reassign re-attributes the EXISTING assignment doc rather than making a claim.
+
+  // Open the Reassign picker: read the SAME fresh pool inputs as the suggestion
+  // engine, list every eligible advisor for the just-assigned case, then DROP the
+  // current holder (you reassign to someone else). Makes no claim and writes
+  // nothing — just builds the menu. `reassignOptions` stays null while in flight.
+  async function openReassign() {
+    if (!lastAssigned) return
+    // Claim this generation up front; a newer open (or a card change) bumps it and
+    // makes our late-resolving read a no-op below.
+    const seq = ++reassignSeq.current
+    const programs = lastAssigned.programs
+    const currentHolder = lastAssigned.fromWorkerId
+    setReassignOptions(null)
+    setReassignError('')
+    try {
+      const [freshWorkers, weeklyCounts, pendingIds, tempUnavailableIds, supervisorUnavailableIds] =
+        await Promise.all([
+          getAllWorkers(db),
+          getWeeklyCounts(db),
+          getPendingIds(db),
+          getTempUnavailableIds(db),
+          getSupervisorUnavailableIds(db),
+        ])
+      if (seq !== reassignSeq.current) return // superseded by a newer open / a new case
+      const list = eligibleWorkers({
+        workers: freshWorkers,
+        weeklyCounts,
+        programs,
+        pendingIds,
+        tempUnavailableIds,
+        supervisorUnavailableIds,
+      })
+        // You reassign to a DIFFERENT advisor — drop whoever currently holds it.
+        .filter((w) => w.id !== currentHolder)
+      setReassignOptions(list.map((w) => ({ worker: w, count: weeklyCountOf(weeklyCounts, w.id) })))
+    } catch (err) {
+      if (seq !== reassignSeq.current) return
+      setReassignError(err?.message ?? String(err))
+      setReassignOptions([]) // render the empty state rather than a stuck spinner
+    }
+  }
+
+  function toggleReassign() {
+    if (reassignBusy) return
+    if (reassigning) {
+      reassignSeq.current++ // invalidate any in-flight open read on close
+      setReassigning(false)
+      return
+    }
+    setReassigning(true)
+    openReassign()
+  }
+
+  // Commit the reassign to `worker`: re-attribute the EXISTING assignment doc from
+  // the current holder to them. Writes NO new count and NO ticket — the derived
+  // weekly count shifts net-zero (old −1, new +1) purely because it is keyed on
+  // workerId (invariant #8). On success fromWorkerId becomes this worker, so a
+  // SECOND reassign chains from here (reassignedFrom then records this worker).
+  async function reassignTo(worker) {
+    if (reassignBusy || !lastAssigned) return
+    setReassignBusy(true)
+    setReassignError('')
+    try {
+      await reassignAssignment(db, {
+        assignmentId: lastAssigned.assignmentId,
+        fromWorkerId: lastAssigned.fromWorkerId,
+        toWorkerId: worker.id,
+      })
+      // Guard against a mid-flight card change: if a program button was tapped
+      // while this updateDoc was in flight, lastAssigned was cleared and a new case
+      // is underway — do NOT resurrect a phantom card ({...null}) over it. The
+      // reassign write already committed durably regardless of the UI.
+      setLastAssigned((prev) =>
+        prev
+          ? {
+              ...prev,
+              workerName: `${worker.firstName} ${worker.lastName}`,
+              fromWorkerId: worker.id,
+              manual: true,
+              reassigned: true,
+            }
+          : prev,
+      )
+      setReassigning(false)
+      setReassignOptions(null)
+    } catch (err) {
+      setReassignError(err?.message ?? String(err))
+    } finally {
+      setReassignBusy(false)
+    }
+  }
+
   async function copyMessage() {
     const composed = caseNumber.trim()
       ? `${messageText}\n\nEWMS Case #: ${caseNumber.trim()}`
@@ -460,14 +754,101 @@ export default function Assign() {
           className="rounded-lg border border-green-200 bg-green-50 px-5 py-4"
           aria-live="polite"
         >
-          <p className="text-sm font-semibold text-green-800">
-            Assigned · Ticket {formatTicket(lastAssigned.ticket)}
-          </p>
-          <p className="mt-0.5 text-sm text-green-700">
-            <span className="font-medium">{lastAssigned.workerName}</span> took the next{' '}
-            {lastAssigned.programsLabel} case. Their weekly count is now +1. Select a program to
-            assign the next case.
-          </p>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <p className="text-sm font-semibold text-green-800">
+                Assigned · Ticket {formatTicket(lastAssigned.ticket)}
+                {lastAssigned.manual && (
+                  <span className="ml-2 inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 align-middle text-xs font-semibold text-blue-800">
+                    Manual
+                  </span>
+                )}
+                {lastAssigned.reassigned && (
+                  <span className="ml-2 inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 align-middle text-xs font-semibold text-amber-800">
+                    Reassigned
+                  </span>
+                )}
+              </p>
+              <p className="mt-0.5 text-sm text-green-700">
+                {lastAssigned.reassigned ? (
+                  <>
+                    <span className="font-medium">{lastAssigned.workerName}</span> now holds this{' '}
+                    {lastAssigned.programsLabel} case (reassigned) — their weekly count +1, the
+                    previous advisor −1. Select a program to assign the next case.
+                  </>
+                ) : (
+                  <>
+                    <span className="font-medium">{lastAssigned.workerName}</span> took the next{' '}
+                    {lastAssigned.programsLabel} case. Their weekly count is now +1. Select a program
+                    to assign the next case.
+                  </>
+                )}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={toggleReassign}
+              disabled={reassignBusy}
+              aria-expanded={reassigning}
+              className="inline-flex shrink-0 items-center justify-center rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              Reassign
+            </button>
+          </div>
+
+          {/* Reassign picker — re-attributes THIS assignment to a different eligible
+              advisor. Writes no new count and no ticket; the derived weekly count
+              shifts net-zero (invariant #8). Fully separate from the suggestion
+              machinery; rendered only while the card exists and the picker is open. */}
+          {reassigning && (
+            <div className="mt-4 rounded-md border border-slate-200 bg-white px-4 py-4">
+              <p className="text-sm font-semibold text-slate-900">
+                Reassign — correct the assigned advisor
+              </p>
+              <p className="mt-0.5 text-xs text-slate-500">
+                Re-attributes this case to a different eligible advisor — no new ticket, same case.
+                The one you pick gains +1 this week and the current advisor drops −1 (net-zero).
+                Flagged as a manual correction.
+              </p>
+              {reassignError && (
+                <p className="mt-3 break-words text-sm text-red-700">{reassignError}</p>
+              )}
+              {reassignOptions === null ? (
+                <p className="mt-3 text-sm text-slate-500">Loading eligible advisors…</p>
+              ) : reassignOptions.length === 0 ? (
+                <p className="mt-3 text-sm text-slate-600">
+                  No other eligible advisor to reassign to.
+                </p>
+              ) : (
+                <div className="mt-3 grid grid-cols-1 gap-2">
+                  {reassignOptions.map(({ worker, count }) => (
+                    <button
+                      key={worker.id}
+                      type="button"
+                      onClick={() => reassignTo(worker)}
+                      disabled={reassignBusy}
+                      className="flex items-center justify-between gap-3 rounded-md border border-slate-300 bg-white px-4 py-3 text-left shadow-sm transition hover:border-blue-400 hover:bg-blue-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      <span className="flex items-center gap-3">
+                        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white text-xs font-bold text-slate-700 ring-1 ring-slate-200">
+                          {worker.firstName[0]}
+                          {worker.lastName[0]}
+                        </span>
+                        <span>
+                          <span className="block text-sm font-semibold text-slate-900">
+                            {worker.firstName} {worker.lastName}
+                          </span>
+                          <span className="mt-0.5 block text-xs text-slate-500">
+                            EA Level {worker.eaLevel} · {count} this week
+                          </span>
+                        </span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -553,6 +934,15 @@ export default function Assign() {
                     >
                       Mark unavailable
                     </button>
+                    <button
+                      type="button"
+                      onClick={toggleOverride}
+                      disabled={!suggestion?.ok || busy}
+                      aria-expanded={overriding}
+                      className="inline-flex items-center justify-center rounded-md border border-blue-300 bg-white px-6 py-4 text-base font-semibold text-blue-800 shadow-sm transition hover:bg-blue-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      Override
+                    </button>
                   </div>
                   {!copied && (
                     <p className="text-xs text-slate-500">Copy the Teams message below and send it to the Advisor to enable Assign.</p>
@@ -620,6 +1010,72 @@ export default function Assign() {
                   )}
                 </div>
               )}
+
+              {/* Override picker — every eligible advisor (all EA levels) for the
+                  still-open case, fairest first. Picking one claims them (the same
+                  concurrency guard) and makes them the suggested worker; the clerk
+                  then re-copies and Assigns normally → the doc is flagged manual.
+                  No count is written here. */}
+              {overriding && (
+                <div className="rounded-md border border-blue-200 bg-blue-50 px-4 py-4">
+                  <p className="text-sm font-semibold text-blue-900">
+                    Override — choose a different advisor
+                  </p>
+                  <p className="mt-0.5 text-xs text-blue-700">
+                    Manual staffing choice. The one you pick is held Pending; re-copy the message and
+                    Assign as usual. Their weekly count still goes up by one on Assign — the
+                    assignment is just flagged as a manual override.
+                  </p>
+                  {overrideOptions === null ? (
+                    <p className="mt-3 text-sm text-slate-500">Loading eligible advisors…</p>
+                  ) : overrideOptions.length === 0 ? (
+                    <p className="mt-3 text-sm text-blue-800">
+                      No other eligible advisor is free right now.
+                    </p>
+                  ) : (
+                    <div className="mt-3 grid grid-cols-1 gap-2">
+                      {overrideOptions.map(({ worker, count }) => {
+                        const isCurrent = activeClaim?.workerId === worker.id
+                        return (
+                          <button
+                            key={worker.id}
+                            type="button"
+                            onClick={() => overrideTo(worker)}
+                            disabled={busy}
+                            aria-current={isCurrent ? 'true' : undefined}
+                            className={[
+                              'flex items-center justify-between gap-3 rounded-md border px-4 py-3 text-left shadow-sm transition focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60',
+                              isCurrent
+                                ? 'border-blue-400 bg-blue-100'
+                                : 'border-slate-300 bg-white hover:border-blue-400 hover:bg-blue-50',
+                            ].join(' ')}
+                          >
+                            <span className="flex items-center gap-3">
+                              <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white text-xs font-bold text-slate-700 ring-1 ring-slate-200">
+                                {worker.firstName[0]}
+                                {worker.lastName[0]}
+                              </span>
+                              <span>
+                                <span className="block text-sm font-semibold text-slate-900">
+                                  {worker.firstName} {worker.lastName}
+                                </span>
+                                <span className="mt-0.5 block text-xs text-slate-500">
+                                  EA Level {worker.eaLevel} · {count} this week
+                                </span>
+                              </span>
+                            </span>
+                            {isCurrent && (
+                              <span className="shrink-0 rounded-full bg-blue-200 px-2.5 py-0.5 text-xs font-semibold text-blue-900">
+                                Current
+                              </span>
+                            )}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -681,9 +1137,9 @@ export default function Assign() {
           />
 
           <label className="mb-1.5 mt-4 block text-xs font-semibold uppercase tracking-wide text-slate-500">
-            EWMS case number <span className="font-normal normal-case text-slate-400">(clipboard only — not saved)</span>
+            EWMS case number <span className="font-normal normal-case text-slate-500">(clipboard only — not saved)</span>
           </label>
-          <div className="flex flex-col gap-3 sm:flex-row">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
             <input
               type="text"
               value={caseNumber}
@@ -697,8 +1153,12 @@ export default function Assign() {
             <button
               type="button"
               onClick={copyMessage}
-              className="inline-flex items-center justify-center gap-2 rounded-md bg-blue-700 px-6 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+              className="inline-flex items-center justify-center gap-2 rounded-md bg-blue-700 px-8 py-4 text-base font-semibold text-white shadow-sm transition hover:bg-blue-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
             >
+              <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="h-5 w-5">
+                <rect x="9" y="9" width="13" height="13" rx="2" />
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+              </svg>
               {copied ? 'Copied ✓' : 'Copy message'}
             </button>
           </div>

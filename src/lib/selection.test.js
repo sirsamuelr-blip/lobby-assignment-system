@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { suggestWorker } from './selection.js'
+import { suggestWorker, eligibleWorkers } from './selection.js'
 import { ROSTER } from './__fixtures__/roster.js'
 
 // Helper: build a weeklyCounts object from { workerId: count } overrides; any
@@ -288,5 +288,85 @@ describe('suggestWorker — no staff', () => {
   it('an entirely empty roster returns the no-staff message', () => {
     const r = suggestWorker({ workers: [], weeklyCounts: counts(), programs: ['mepd'] })
     expect(r).toEqual({ ok: false, message: 'No staff available for MEPD' })
+  })
+})
+
+describe('eligibleWorkers — the manual-override candidate list', () => {
+  // Same EA3 fixtures as the last-resort tests: ea3early (Able, EA3) sorts before
+  // ea1 (Zimmer, EA1). suggestWorker would keep the EA3 out; eligibleWorkers must
+  // include it (a manual override may pick an EA3), so the two diverge here.
+  const ea1 = { id: 'ea1', firstName: 'Zoe', lastName: 'Zimmer', eaLevel: 1, programs: { snap: true }, active: true }
+  const ea3early = { id: 'ea3early', firstName: 'Amy', lastName: 'Able', eaLevel: 3, programs: { snap: true }, active: true }
+
+  it('returns ALL eligible across EA levels (no EA3 last-resort collapse), sorted by fairness', () => {
+    const list = eligibleWorkers({ workers: [ea1, ea3early], weeklyCounts: counts(), programs: ['snap'] })
+    // Both count 0 → lastName decides: Able (EA3) before Zimmer (EA1). The EA3 is
+    // present, which suggestWorker would have filtered out of its primary pool.
+    expect(list.map((w) => w.id)).toEqual(['ea3early', 'ea1'])
+    // Contrast: suggestWorker keeps the EA3 out and picks the EA1.
+    expect(suggestWorker({ workers: [ea1, ea3early], weeklyCounts: counts(), programs: ['snap'] }).worker.id).toBe('ea1')
+  })
+
+  it('orders by weeklyCount first (EA3 with a higher count sorts after the EA1)', () => {
+    const list = eligibleWorkers({
+      workers: [ea1, ea3early],
+      weeklyCounts: counts({ ea3early: 5 }),
+      programs: ['snap'],
+    })
+    expect(list.map((w) => w.id)).toEqual(['ea1', 'ea3early'])
+  })
+
+  it('excludes pending / temp / supervisor-unavailable / untrained workers', () => {
+    const list = eligibleWorkers({
+      workers: ROSTER,
+      weeklyCounts: counts(),
+      programs: ['snap'],
+      pendingIds: ['worker-01'],
+      tempUnavailableIds: ['worker-03'],
+      supervisorUnavailableIds: ['worker-05'],
+    })
+    const ids = list.map((w) => w.id)
+    expect(ids).not.toContain('worker-01') // pending
+    expect(ids).not.toContain('worker-03') // temp-unavailable
+    expect(ids).not.toContain('worker-05') // supervisor-unavailable
+    expect(ids).not.toContain('worker-16') // Perez is medicaid-only → untrained for SNAP
+    // Everyone returned is active AND trained in the requested program.
+    expect(list.every((w) => w.active === true && w.programs.snap === true)).toBe(true)
+  })
+
+  it('excludes inactive workers', () => {
+    const fixture = [
+      { id: 'a', firstName: 'A', lastName: 'Aa', eaLevel: 1, programs: { snap: true }, active: true },
+      { id: 'b', firstName: 'B', lastName: 'Bb', eaLevel: 1, programs: { snap: true }, active: false },
+    ]
+    const list = eligibleWorkers({ workers: fixture, weeklyCounts: counts(), programs: ['snap'] })
+    expect(list.map((w) => w.id)).toEqual(['a'])
+  })
+
+  it('multi-program: returns only workers trained in EVERY program (intersection), sorted', () => {
+    const list = eligibleWorkers({
+      workers: ROSTER,
+      weeklyCounts: counts(),
+      programs: ['snap', 'tanf', 'mepd', 'medicaid'],
+    })
+    // Only Edwards (05) and Martin (13) are trained in all four; Edwards < Martin.
+    expect(list.map((w) => w.id)).toEqual(['worker-05', 'worker-13'])
+  })
+
+  it('returns [] for empty / missing / non-array programs', () => {
+    expect(eligibleWorkers({ workers: ROSTER, weeklyCounts: counts(), programs: [] })).toEqual([])
+    expect(eligibleWorkers({ workers: ROSTER, weeklyCounts: counts() })).toEqual([])
+    expect(eligibleWorkers({ workers: ROSTER, weeklyCounts: counts(), programs: 'snap' })).toEqual([])
+  })
+
+  it('is null-safe on empty / missing workers', () => {
+    expect(eligibleWorkers({ workers: [], weeklyCounts: counts(), programs: ['snap'] })).toEqual([])
+    expect(eligibleWorkers({ weeklyCounts: counts(), programs: ['snap'] })).toEqual([])
+  })
+
+  it('does not mutate the caller-supplied workers array', () => {
+    const before = ROSTER.map((w) => w.id)
+    eligibleWorkers({ workers: ROSTER, weeklyCounts: counts({ 'worker-01': 5 }), programs: ['snap'] })
+    expect(ROSTER.map((w) => w.id)).toEqual(before)
   })
 })

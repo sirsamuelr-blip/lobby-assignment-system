@@ -218,6 +218,7 @@ export async function suggestAndClaim({
   weeklyCounts,
   pendingIds,
   tempUnavailableIds = [],
+  supervisorUnavailableIds = [],
   programs,
   clerkId,
   db,
@@ -230,11 +231,13 @@ export async function suggestAndClaim({
       workers,
       weeklyCounts,
       programs,
-      // Pending (+ race-taken) and temp-unavailable are SEPARATE exclusion sets —
-      // pass each straight through; suggestWorker unions them internally. Merging
-      // here would be harmless today but blurs two distinct states.
+      // Pending (+ race-taken), temp-unavailable, and supervisor-unavailable are
+      // THREE SEPARATE exclusion sets — pass each straight through; suggestWorker
+      // unions them internally. Merging here would be harmless today but blurs
+      // three distinct states.
       pendingIds: [...(pendingIds ?? []), ...taken],
       tempUnavailableIds,
+      supervisorUnavailableIds,
     })
     if (!s.ok) return s // e.g. "No staff available…" — short-circuit, no claim
     const r = await claimFn({ workerId: s.worker.id, clerkId, programs })

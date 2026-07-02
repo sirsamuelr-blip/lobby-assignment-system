@@ -16,8 +16,27 @@
 // throwing BEFORE it reads the counter so a failed Assign can't consume a ticket
 // — then writes the assignment, advances the counter, and clears the pending doc
 // atomically. Pending never increments a count.
+//
+// REASSIGN (invariant #8): reassignAssignment re-attributes an EXISTING doc to a
+// different worker — it writes NO new doc, no counter, and no ticket. Because the
+// weekly count is DERIVED per workerId (counts.js), simply changing `workerId` IS
+// the correction: the wrongly-credited worker drops −1 and the new one gains +1,
+// net-zero, with no stored tally to reconcile. A reassigned doc additionally
+// carries `reassignedFrom` — the previous worker's id, a STAFF workerId, still
+// never any client data (invariant #1) — and is forced manual:true (a human
+// correction). Its ticket and timestamp are left untouched (same case).
 
-import { doc, collection, runTransaction, serverTimestamp } from 'firebase/firestore'
+import {
+  doc,
+  collection,
+  query,
+  orderBy,
+  limit,
+  onSnapshot,
+  runTransaction,
+  serverTimestamp,
+  updateDoc,
+} from 'firebase/firestore'
 import { TICKET_COUNTER, advanceTicket } from './tickets.js'
 import { pendingDocId } from './pending.js'
 
@@ -89,4 +108,90 @@ export async function createAssignment(db, { programs, workerId, clerkId, manual
   })
 
   return { ticket, id: assignmentRef.id }
+}
+
+/**
+ * Re-attribute an EXISTING assignment to a different worker — a human correction
+ * of a wrong-worker Assign (invariant #8). This writes NO new assignment, no
+ * counter, and no ticket: the weekly count is DERIVED per workerId (counts.js),
+ * so changing `workerId` IS the correction — the wrongly-credited worker drops
+ * −1 and the new worker gains +1, net-zero, with nothing to reconcile.
+ *
+ * The doc's `ticket` and `timestamp` are left untouched (it is the same case).
+ * The only new field is `reassignedFrom`, the previous worker's id — a STAFF
+ * workerId, never a case number or client name (invariant #1). `manual` is forced
+ * true, because a reassign is always a human override. A single-doc update: no
+ * transaction is needed (no counter, no pending claim to reconcile atomically).
+ *
+ * @param {import('firebase/firestore').Firestore} db
+ * @param {object} args
+ * @param {string} args.assignmentId  the existing assignment doc id
+ * @param {string} args.fromWorkerId  the wrongly-credited worker (recorded as reassignedFrom)
+ * @param {string} args.toWorkerId    the worker who should hold the case
+ * @returns {Promise<void>}
+ */
+export async function reassignAssignment(db, { assignmentId, fromWorkerId, toWorkerId }) {
+  if (!assignmentId) throw new Error('reassignAssignment: assignmentId is required')
+  if (!toWorkerId) throw new Error('reassignAssignment: toWorkerId is required')
+  if (fromWorkerId === toWorkerId) {
+    throw new Error('reassignAssignment: already assigned to that advisor')
+  }
+  await updateDoc(doc(db, 'assignments', assignmentId), {
+    workerId: toWorkerId,
+    manual: true,
+    reassignedFrom: fromWorkerId,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// READ-ONLY subscription over `assignments` — for the Log / Reports views.
+//
+// This is purely a READ over the single source of truth (invariant #6): it
+// writes NOTHING, derives NOTHING about counts, and never touches a counter, a
+// pending doc, or a ticket. Weekly counts still derive from these same docs via
+// counts.js; this subscription only mirrors the raw rows, newest first, for a
+// chronological record. Safe to mount from any read-only screen. There is no
+// set / add / update / delete / runTransaction / serverTimestamp call below.
+// ---------------------------------------------------------------------------
+
+/**
+ * Live subscription over the `assignments` collection, newest first. Mirrors
+ * subscribeWorkers' shape: hands `cb` the array of normalized rows on every
+ * change and forwards a subscription error to `onError` (optional). Returns the
+ * unsubscribe fn. Capped at the 200 most recent docs so the Log stays light.
+ *
+ * Each doc is read with the ESTIMATE serverTimestamps option so a just-written
+ * `serverTimestamp` renders immediately (as the client's best estimate) instead
+ * of arriving null on the first local snapshot; `timestamp` is still tolerated
+ * as null defensively and normalized to millis (or null).
+ *
+ * @param {import('firebase/firestore').Firestore} db
+ * @param {(rows: Array<{id: string, ticket: number, timestamp: number|null, programs: string[], workerId: string, clerkId: string, manual: boolean, reassignedFrom?: string}>) => void} cb
+ * @param {(err: Error) => void} [onError]
+ * @returns {import('firebase/firestore').Unsubscribe}
+ */
+export function subscribeAssignments(db, cb, onError) {
+  const q = query(collection(db, 'assignments'), orderBy('timestamp', 'desc'), limit(200))
+  return onSnapshot(
+    q,
+    (snap) =>
+      cb(
+        snap.docs.map((d) => {
+          const data = d.data({ serverTimestamps: 'estimate' })
+          return {
+            id: d.id,
+            ticket: data.ticket,
+            // Tolerate a still-null serverTimestamp defensively (estimate should
+            // fill it, but never call .toMillis on a null).
+            timestamp: data.timestamp?.toMillis?.() ?? null,
+            programs: data.programs,
+            workerId: data.workerId,
+            clerkId: data.clerkId,
+            manual: data.manual,
+            reassignedFrom: data.reassignedFrom,
+          }
+        }),
+      ),
+    (err) => onError && onError(err),
+  )
 }

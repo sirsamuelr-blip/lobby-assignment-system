@@ -23,15 +23,21 @@ data is stored, see [`docs/DATA_HANDLING.md`](docs/DATA_HANDLING.md).
 
 ## Implementation status
 
-This project is at **Phase 0** (scaffold + connectivity check). The controls
-above describe the **target posture**; several are introduced in later phases:
+The controls above are **implemented**. Per-person Firebase Auth gates the whole
+app, and Firestore Security Rules (`firestore.rules`) enforce role-gating at the
+data layer: only signed-in staff can read; only supervisors can write the
+`workers` / `unavailability` collections; the `assignments` log is append-only
+and records only the acting clerk's own id; and no extra field (e.g. client
+data) can be written to any collection. The rules ship with the repo and are
+covered by an emulator test suite (`npm run test:rules`).
 
-- Firestore Security Rules and role-gating land in the auth phase. Until then,
-  do **not** deploy an instance with test-mode (open) rules to anywhere holding
-  real data.
-- Before any pilot with real staff data, confirm that Firestore rules deny reads
-  and writes to unauthenticated users and restrict admin collections to
-  supervisors.
+- **Deploy the rules before real data.** A fresh Firebase project starts in
+  test-mode (open) rules; run `firebase deploy --only firestore:rules` before an
+  instance goes in front of staff, and confirm in the Firebase console that the
+  deployed rules are the ones in this repo — not the test-mode default.
+- Before any pilot, verify that unauthenticated reads/writes are denied and that
+  a clerk account cannot write the admin collections. The Rules Playground in
+  the Firebase console can simulate both.
 
 ## Secrets and configuration
 

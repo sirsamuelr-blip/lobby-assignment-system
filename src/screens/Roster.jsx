@@ -1,32 +1,45 @@
 import { useEffect, useState } from 'react'
 import { db } from '../firebase'
-import { getAllWorkers } from '../lib/workers'
+import { subscribeWorkers } from '../lib/workers'
 import { PROGRAM_LABELS } from '../lib/selection'
 import { activePendingIds, subscribePending } from '../lib/pending'
 import { activeTempUnavailableIds, subscribeTempUnavailable } from '../lib/unavailable'
+import {
+  activeSupervisorUnavailableIds,
+  isSupervisorUnavailableOn,
+  subscribeUnavailability,
+  UNAVAIL_TYPE_LABELS,
+} from '../lib/supervisorUnavailability'
 
 const PROGRAMS = ['snap', 'tanf', 'mepd', 'medicaid']
 
 /**
- * Derive a worker's live status. Kept as a small helper so later phases extend it
- * cleanly: Phase 4 adds 'temp' (temp-unavailable → amber/orange) and Phase 5 adds
- * 'out' (WFH/PTO/etc → grey). Today: temp (out for 30 min) vs pending (yellow) vs
- * available (green). Temp is checked FIRST — a marked-unavailable worker is out of
- * the pool, so that state wins even if a stale pending doc lingers a moment.
+ * Derive a worker's live status, in strict precedence order. A deactivated worker
+ * ('inactive') outranks everything; then supervisor-set unavailability ('out',
+ * grey, date-based — WFH/PTO/special project/callout); then temp-unavailable
+ * ('temp', clerk-set 30-min); then pending ('pending', suggested); else available.
+ * Higher-precedence states describe a worker who is more firmly out of the pool, so
+ * they win even if a lower-precedence doc lingers a moment.
  *
- * @param {{id: string}} worker
- * @param {{pendingIds?: string[], tempUnavailableIds?: string[]}} live
- * @returns {'temp' | 'pending' | 'available'}
+ * @param {{id: string, active?: boolean}} worker
+ * @param {{pendingIds?: string[], tempUnavailableIds?: string[], supervisorUnavailableIds?: string[]}} live
+ * @returns {'inactive' | 'out' | 'temp' | 'pending' | 'available'}
  */
-export function workerStatus(worker, { pendingIds = [], tempUnavailableIds = [] } = {}) {
+export function workerStatus(
+  worker,
+  { pendingIds = [], tempUnavailableIds = [], supervisorUnavailableIds = [] } = {},
+) {
+  if (worker.active === false) return 'inactive'
+  if (supervisorUnavailableIds.includes(worker.id)) return 'out'
   if (tempUnavailableIds.includes(worker.id)) return 'temp'
   if (pendingIds.includes(worker.id)) return 'pending'
   return 'available'
 }
 
-// Color coding matches CLAUDE.md's warm family: green = available, yellow =
-// pending, and temp-unavailable also warm but a DISTINCT orange shade + its own
-// "Unavailable" label, so a clerk can tell the two apart at a glance.
+// Color coding matches CLAUDE.md's palette: green = available, yellow = pending,
+// orange = temp-unavailable (a DISTINCT warm shade so a clerk can tell the two
+// apart), and grey = out (supervisor-set) / inactive (deactivated) — both fully
+// out of the pool, so they read as neutral-cool, not warm.
 const STATUS_STYLES = {
   available: {
     label: 'Available',
@@ -45,6 +58,18 @@ const STATUS_STYLES = {
     pill: 'bg-orange-200 text-orange-900',
     dot: 'bg-orange-500',
     card: 'border-orange-300 bg-orange-50/60',
+  },
+  out: {
+    label: 'Out',
+    pill: 'bg-slate-200 text-slate-700',
+    dot: 'bg-slate-500',
+    card: 'border-slate-300 bg-slate-50',
+  },
+  inactive: {
+    label: 'Inactive',
+    pill: 'bg-slate-100 text-slate-500',
+    dot: 'bg-slate-400',
+    card: 'border-slate-200 bg-slate-50/60',
   },
 }
 
@@ -65,18 +90,19 @@ export default function Roster() {
   const [rosterError, setRosterError] = useState('')
   const [pendingDocs, setPendingDocs] = useState([])
   const [tempDocs, setTempDocs] = useState([])
+  const [unavailDocs, setUnavailDocs] = useState([])
   // ~1s tick so expired yellows flip back to green and countdowns move without a
   // manual refresh (Pending is derived from expiresAt > now, not from a delete).
   const [nowTick, setNowTick] = useState(() => Date.now())
 
+  // Live roster — the Admin page can add/edit/deactivate workers, so subscribe
+  // (like subscribePending below) rather than loading once; deactivations and
+  // edits repaint without a reload.
   useEffect(() => {
-    let cancelled = false
-    getAllWorkers(db)
-      .then((ws) => !cancelled && setWorkers(ws))
-      .catch((err) => !cancelled && setRosterError(err?.message ?? String(err)))
-    return () => {
-      cancelled = true
-    }
+    const unsub = subscribeWorkers(db, setWorkers, (err) =>
+      setRosterError(err?.message ?? String(err)),
+    )
+    return () => unsub()
   }, [])
 
   // Live pending state, shared across all clerks' tabs.
@@ -88,6 +114,14 @@ export default function Roster() {
   // Live temp-unavailable state, likewise shared across all tabs.
   useEffect(() => {
     const unsub = subscribeTempUnavailable(db, setTempDocs)
+    return () => unsub()
+  }, [])
+
+  // Live supervisor-set unavailability (the whole small collection). Who is "out
+  // today" is derived from these by date logic against the same 1s nowTick below,
+  // so a day roll-over (or a range ending) flips the pill without a refresh.
+  useEffect(() => {
+    const unsub = subscribeUnavailability(db, setUnavailDocs)
     return () => unsub()
   }, [])
 
@@ -118,6 +152,16 @@ export default function Roster() {
     if (untilMs > nowTick) untilByWorker.set(d.workerId, untilMs)
   }
 
+  // Supervisor-set unavailability: date logic (not a timer) against the live day.
+  // Also map each out worker → the type of their FIRST active doc, for the pill's
+  // "Out · <TYPE>" label. No countdown — this is calendar-based, not a short window.
+  const supervisorUnavailableIds = activeSupervisorUnavailableIds(unavailDocs, nowTick)
+  const outTypeByWorker = new Map()
+  for (const d of unavailDocs) {
+    if (!d?.workerId || outTypeByWorker.has(d.workerId)) continue
+    if (isSupervisorUnavailableOn(d, nowTick)) outTypeByWorker.set(d.workerId, d.type)
+  }
+
   if (rosterError) {
     return (
       <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3">
@@ -134,11 +178,16 @@ export default function Roster() {
   const sorted = [...workers].sort(
     (a, b) => a.lastName.localeCompare(b.lastName) || a.firstName.localeCompare(b.firstName),
   )
-  const live = { pendingIds, tempUnavailableIds }
-  const pendingCount = sorted.filter((w) => workerStatus(w, live) === 'pending').length
-  const tempCount = sorted.filter((w) => workerStatus(w, live) === 'temp').length
-  // Temp workers are OUT of the pool, so they are NOT counted as available.
-  const availableCount = sorted.length - pendingCount - tempCount
+  const live = { pendingIds, tempUnavailableIds, supervisorUnavailableIds }
+  // Tallies count only ACTIVE workers — inactive (deactivated) ones are not part of
+  // the pool math at all, just rendered greyed with an "Inactive" pill.
+  const activeWorkers = sorted.filter((w) => w.active !== false)
+  const pendingCount = activeWorkers.filter((w) => workerStatus(w, live) === 'pending').length
+  const tempCount = activeWorkers.filter((w) => workerStatus(w, live) === 'temp').length
+  const outCount = activeWorkers.filter((w) => workerStatus(w, live) === 'out').length
+  // Pending, temp, and out workers are all OUT of the pool, so none count as available.
+  const availableCount = activeWorkers.length - pendingCount - tempCount - outCount
+  const inactiveCount = sorted.length - activeWorkers.length
 
   return (
     <div className="space-y-6">
@@ -148,9 +197,10 @@ export default function Roster() {
           Everyone on the roster, updating live as clerks work. A worker turns{' '}
           <span className="font-medium text-amber-700">yellow (Pending)</span> the instant they are
           suggested, <span className="font-medium text-orange-700">orange (Unavailable)</span> when a
-          clerk marks them out for 30 minutes, and back to{' '}
-          <span className="font-medium text-green-700">green</span> when assigned, released, or the
-          window lapses.
+          clerk marks them out for 30 minutes, <span className="font-medium text-slate-600">grey
+          (Out)</span> when a supervisor has them on WFH / PTO / a special project / a callout, and
+          back to <span className="font-medium text-green-700">green</span> when assigned, released,
+          or the window lapses.
         </p>
         <div className="mt-3 flex flex-wrap gap-2 text-xs font-semibold">
           <span className="inline-flex items-center gap-1.5 rounded-full bg-green-100 px-3 py-1 text-green-800">
@@ -162,6 +212,14 @@ export default function Roster() {
           <span className="inline-flex items-center gap-1.5 rounded-full bg-orange-200 px-3 py-1 text-orange-900">
             <span className="h-2 w-2 rounded-full bg-orange-500" /> {tempCount} unavailable
           </span>
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-slate-200 px-3 py-1 text-slate-700">
+            <span className="h-2 w-2 rounded-full bg-slate-500" /> {outCount} out
+          </span>
+          {inactiveCount > 0 && (
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-slate-100 px-3 py-1 text-slate-500">
+              <span className="h-2 w-2 rounded-full bg-slate-400" /> {inactiveCount} inactive
+            </span>
+          )}
         </div>
       </section>
 
@@ -169,8 +227,19 @@ export default function Roster() {
         {sorted.map((worker) => {
           const status = workerStatus(worker, live)
           const style = STATUS_STYLES[status]
-          // Pending counts down to its 10-min expiresAt; temp to its 30-min until.
-          const expMs = status === 'temp' ? untilByWorker.get(worker.id) : expiryByWorker.get(worker.id)
+          // 'Out' shows the absence type inline (e.g. "Out · PTO"); every other
+          // status uses its plain label.
+          const outType = status === 'out' ? outTypeByWorker.get(worker.id) : null
+          const label =
+            outType != null ? `${style.label} · ${UNAVAIL_TYPE_LABELS[outType] ?? outType}` : style.label
+          // Only pending (10-min expiresAt) and temp (30-min until) get a countdown.
+          // Out/inactive are date-based, not a short timer — no countdown.
+          const expMs =
+            status === 'pending'
+              ? expiryByWorker.get(worker.id)
+              : status === 'temp'
+                ? untilByWorker.get(worker.id)
+                : null
           return (
             <div
               key={worker.id}
@@ -201,7 +270,7 @@ export default function Roster() {
                   ].join(' ')}
                 >
                   <span className={['h-2 w-2 rounded-full', style.dot].join(' ')} />
-                  {style.label}
+                  {label}
                 </span>
                 {(status === 'pending' || status === 'temp') && expMs != null && (
                   <span

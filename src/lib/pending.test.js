@@ -121,6 +121,13 @@ describe('suggestAndClaim — suggest + claim with bounded race re-pick (no Fire
     expect(r.worker.id).toBe('worker-02')
   })
 
+  it('excludes supervisorUnavailableIds from the suggestion (worker-01 out → worker-02)', async () => {
+    const claimFn = async () => ({ claimed: true })
+    const r = await suggestAndClaim({ ...base, supervisorUnavailableIds: ['worker-01'], claimFn })
+    expect(r.ok).toBe(true)
+    expect(r.worker.id).toBe('worker-02')
+  })
+
   it('claimFn fails for worker-01 then claims → returns worker-02 (race re-pick excludes the taken worker)', async () => {
     const claimFn = async ({ workerId }) =>
       workerId === 'worker-01' ? { claimed: false } : { claimed: true }

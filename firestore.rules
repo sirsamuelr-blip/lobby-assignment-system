@@ -1,0 +1,97 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function roleOf(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data.role;
+    }
+    function hasRoleDoc() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+    function isSupervisor() {
+      return hasRoleDoc() && roleOf(request.auth.uid) == 'supervisor';
+    }
+    function isStaff() {
+      return hasRoleDoc() && roleOf(request.auth.uid) in ['clerk', 'supervisor'];
+    }
+
+    // Login accounts. Any signed-in user READS (own role at login + the Log's
+    // clerkId->name join). No client writes — seeded out-of-band (client SDK
+    // against a temporary open ruleset, or the Admin SDK).
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
+    // Advisor roster — supervisor-managed. hasOnly() blocks any smuggled field
+    // (e.g. client PII) at the rules layer, not just by app convention.
+    match /workers/{workerId} {
+      allow read: if signedIn();
+      allow write: if isSupervisor()
+        && request.resource.data.keys().hasOnly(
+             ['id', 'firstName', 'lastName', 'eaLevel', 'programs', 'active']);
+    }
+
+    // Supervisor-set absences — supervisor-managed.
+    match /unavailability/{docId} {
+      allow read: if signedIn();
+      allow write: if isSupervisor();
+    }
+
+    // The append-only audit log.
+    match /assignments/{docId} {
+      allow read: if signedIn();
+
+      // Create: staff only; you may only record YOURSELF as the acting clerk
+      // (no forging another clerk's id); and hasOnly() structurally forbids any
+      // extra field — this is invariant #1 (NO CLIENT PII) enforced at the data
+      // layer, so a smuggled client-name field is rejected by Firestore itself.
+      allow create: if isStaff()
+        && request.resource.data.clerkId == request.auth.uid
+        && request.resource.data.keys().hasOnly(
+             ['ticket', 'timestamp', 'programs', 'workerId', 'clerkId', 'manual']);
+
+      // Update = reassign only. hasOnly() bounds the doc to its known seven-key
+      // shape, so a client-PII field can't be smuggled in through update the way
+      // create already prevents. The four fields below are immutable; only
+      // workerId / manual / reassignedFrom may change.
+      allow update: if isStaff()
+        && request.resource.data.keys().hasOnly(
+             ['ticket', 'timestamp', 'programs', 'workerId', 'clerkId', 'manual',
+              'reassignedFrom'])
+        && request.resource.data.ticket    == resource.data.ticket
+        && request.resource.data.timestamp == resource.data.timestamp
+        && request.resource.data.programs  == resource.data.programs
+        && request.resource.data.clerkId   == resource.data.clerkId;
+
+      // Audit integrity: the log is never deleted.
+      allow delete: if false;
+    }
+
+    // Ephemeral operational state (pending claims + temp-unavailable). Staff
+    // read/write. Deliberately NOT owner-scoped: the concurrency guard reclaims
+    // another clerk's EXPIRED pending doc, and createAssignment deletes the
+    // pending doc it just confirmed — both write docs this user doesn't "own",
+    // so scoping writes to the owner would break the guard.
+    match /liveState/{docId} {
+      allow read: if signedIn();
+      allow write: if isStaff();
+    }
+
+    // Ticket counter (counters/tickets) — read+written inside the assign
+    // transaction; staff only.
+    match /counters/{docId} {
+      allow read: if signedIn();
+      allow write: if isStaff();
+    }
+
+    // Everything else: denied. (Default-deny is implicit; stated for clarity.)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

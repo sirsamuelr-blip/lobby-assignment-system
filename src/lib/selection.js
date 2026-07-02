@@ -37,6 +37,19 @@ function countFor(weeklyCounts, workerId) {
   return typeof raw === 'number' ? raw : 0
 }
 
+// The selection sort key (invariant #3), factored out so the automatic pick
+// (suggestWorker) and the full eligible list (eligibleWorkers) order rows
+// IDENTICALLY: weeklyCount ASC → lastName ASC → firstName ASC. Pure; reads counts
+// via countFor so a missing id is 0.
+function compareByFairness(a, b, weeklyCounts) {
+  const ca = countFor(weeklyCounts, a.id)
+  const cb = countFor(weeklyCounts, b.id)
+  if (ca !== cb) return ca - cb
+  const byLast = a.lastName.localeCompare(b.lastName)
+  if (byLast !== 0) return byLast
+  return a.firstName.localeCompare(b.firstName)
+}
+
 /**
  * Suggest the fairest eligible worker for one or more programs, or report no
  * staff. A candidate must be trained in EVERY selected program (intersection).
@@ -94,14 +107,54 @@ export function suggestWorker({
   }
 
   // #3 Selection key — copy then sort so we never mutate the caller's array.
-  const sorted = [...pool].sort((a, b) => {
-    const ca = countFor(weeklyCounts, a.id)
-    const cb = countFor(weeklyCounts, b.id)
-    if (ca !== cb) return ca - cb
-    const byLast = a.lastName.localeCompare(b.lastName)
-    if (byLast !== 0) return byLast
-    return a.firstName.localeCompare(b.firstName)
-  })
+  const sorted = [...pool].sort((a, b) => compareByFairness(a, b, weeklyCounts))
 
   return { ok: true, worker: sorted[0] }
+}
+
+/**
+ * Every ELIGIBLE worker for the given program(s), sorted by the same fairness key
+ * as suggestWorker — the candidate list a clerk chooses from in a manual Override
+ * (Phase 6). "Eligible" = active, trained in EVERY selected program (the same
+ * intersection suggestWorker uses), and in NONE of the exclusion sets.
+ *
+ * Unlike suggestWorker there is NO EA3-last-resort collapse: this returns workers
+ * across ALL EA levels, because a manual override may deliberately pick an EA3.
+ * The count still increments the normal way when that choice is Assigned (invariant
+ * #2) — this function makes no claim and writes nothing.
+ *
+ * Empty/malformed programs → []. Null-safe on workers. Never mutates its input.
+ *
+ * @param {object}   args
+ * @param {Array}    args.workers
+ * @param {Map|object} args.weeklyCounts
+ * @param {string[]} args.programs
+ * @param {string[]} [args.pendingIds]
+ * @param {string[]} [args.tempUnavailableIds]
+ * @param {string[]} [args.supervisorUnavailableIds]
+ * @returns {Array} eligible workers, sorted weeklyCount ASC → lastName ASC → firstName ASC
+ */
+export function eligibleWorkers({
+  workers,
+  weeklyCounts,
+  programs,
+  pendingIds = [],
+  tempUnavailableIds = [],
+  supervisorUnavailableIds = [],
+}) {
+  if (!Array.isArray(programs) || programs.length === 0) return []
+
+  const excluded = new Set([...pendingIds, ...tempUnavailableIds, ...supervisorUnavailableIds])
+
+  // Same eligibility test as suggestWorker (active + trained-in-EVERY-program +
+  // not excluded) — but WITHOUT the EA3-last-resort collapse, so every level is
+  // offered.
+  const candidates = (workers ?? []).filter(
+    (w) =>
+      w.active === true &&
+      programs.every((p) => w.programs?.[p] === true) &&
+      !excluded.has(w.id),
+  )
+
+  return [...candidates].sort((a, b) => compareByFairness(a, b, weeklyCounts))
 }

@@ -11,10 +11,12 @@ The app balances **staff workload**. To do that it needs to know about the
 office's **advisors, clerks, and supervisors** — not about clients. It therefore
 stores staff and operational data, and deliberately holds **no client PII**.
 
-The one point of contact with the outside world is a case/ticket **reference
-number** the clerk types in so an assignment can be traced back to EWMS. That
-reference is an identifier the office already uses internally; the app stores the
-number and nothing else about the case.
+The clerk does type the office's EWMS case number into the Teams message so the
+receiving advisor can find the case — but that number is copied to the clipboard
+**with the message** and handed to Microsoft Teams. It is **never written to this
+app's database**. The only identifier stored against an assignment is a sequential
+`ticket` label the app generates itself (`#0001`, `#0002`, …), an
+order-of-assignment counter that carries no case or client information.
 
 ## What is stored (by collection)
 
@@ -47,22 +49,23 @@ Staff scheduling only.
 ### `assignments` — the audit log (source of truth)
 | Field | Purpose |
 | --- | --- |
-| `ticket` | The EWMS case/ticket **reference number** the clerk enters. Used only to trace the assignment back to EWMS. |
+| `ticket` | A sequential label the app generates itself (`#0001`, `#0002`, …). It is **not** the EWMS case number — just an order-of-assignment counter, carrying no case or client information. |
 | `timestamp` | When the assignment was made; drives the weekly-count window. |
-| `program` | Which program the case was for. |
+| `programs` | Which program(s) the case covered — an array, since one visit may span several (e.g. SNAP + Medicaid). One case is one row regardless of how many programs it lists. |
 | `workerId` | Which advisor was assigned. |
 | `clerkId` | Which clerk recorded the assignment. |
 | `manual` | Whether it was a manual override. |
+| `reassignedFrom` (only on a corrected assignment) | The **advisor** the case was moved away from when a wrong-worker assignment was corrected — a staff workerId, never client data. |
 
-This is the single source of truth for all counts and reports. It contains a
-**case reference number**, but no client name, no case content, and no
-eligibility information.
+This is the single source of truth for all counts and reports. It contains only
+the fields above — **no EWMS case number**, no client name, no case content, and
+no eligibility information.
 
 ### `liveState` — ephemeral operational state
 | Shape | Purpose | Lifetime |
 | --- | --- | --- |
-| pending { workerId, caseTicket, clerkId, suggestedAt, expiresAt } | Holds a suggested advisor out of the pool so two clerks can't double-book. | Auto-expires (~10 min). |
-| temp-unavailable { workerId, reason, until } | Skips an advisor who said they can't take the case. | Auto-expires (~30 min). |
+| pending { workerId, programs, clerkId, suggestedAt, expiresAt } | Holds a suggested advisor out of the pool so two clerks can't double-book. | Auto-expires (~10 min). |
+| temp-unavailable { workerId, reason, until } | Skips an advisor who said they can't take the case; `reason` is a fixed staffing note (e.g. "Away from desk"), never client information. | Auto-expires (~30 min). |
 
 Short-lived operational state; nothing here is client PII.
 
@@ -78,13 +81,15 @@ message** so the receiving advisor knows whose case it is — but that message i
 handed to Microsoft Teams and is **not persisted by this app**. The app stores
 only the fields listed above.
 
-## A note on the case/ticket number
+## A note on the EWMS case number
 
-The `ticket` field is the app's only reference to external case data. On its own
-it is an internal case identifier, not client content — but whether a bare case
-number is treated as sensitive can vary by agency policy. Before a pilot, we
-recommend confirming with your office's privacy/records team how case reference
-numbers should be handled, and restricting who can view the log accordingly.
+The app never stores the EWMS case number. When a clerk copies the Teams message,
+the case number they typed is placed on the clipboard **with that message** and
+handed to Microsoft Teams — it is not written to Firestore or anywhere else in
+this system. The only identifier retained against an assignment is the app's own
+sequential `ticket` label, a counter that reveals nothing about the case or the
+client. The complete record the app keeps for an assignment is: ticket,
+program(s), advisor, clerk, and timestamp — nothing more.
 
 ## Retention
 

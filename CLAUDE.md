@@ -130,8 +130,8 @@ schedules.
 
 - `users` — `{ uid, name, role: "clerk"|"supervisor" }`
 - `workers` — `{ id, firstName, lastName, eaLevel: 1|2|3, programs: { snap, tanf, mepd, medicaid: bool }, active: bool }`
-- `unavailability` — `{ workerId, type: "wfh"|"pto"|"special_project"|"callout", mode: "single"|"range"|"recurring", date | startDate+endDate | weekday }`
-- `assignments` — `{ ticket, timestamp, programs: string[], workerId, clerkId, manual: bool }`  ← source of truth (one case, one doc, +1 — even when `programs` lists several)
+- `unavailability` — `{ workerId, type: "wfh"|"pto"|"special_project"|"callout", mode: "single"|"range"|"recurring", date?: "YYYY-MM-DD" | startDate?+endDate?: "YYYY-MM-DD" | weekday?: 1–7 (Luxon Mon=1…Sun=7), createdAt }` — supervisor-set; "out today" is pure date logic in WEEK_ZONE (`supervisorUnavailability.js`); all four types remove from the pool identically
+- `assignments` — `{ ticket, timestamp, programs: string[], workerId, clerkId, manual: bool, reassignedFrom?: string }`  ← source of truth (one case, one doc, +1 — even when `programs` lists several). A **reassign** re-attributes an existing doc: it sets `workerId` to the new advisor, forces `manual: true`, and records `reassignedFrom` (the previous **staff** workerId — never client data). The count correction is pure re-attribution — the derived weekly count shifts net-zero (old −1, new +1) with no stored counter (invariant #8); `ticket` + `timestamp` are unchanged.
 - `liveState` — pending `{ kind: 'pending', workerId, programs: string[], clerkId, suggestedAt, expiresAt }` (doc id `pending_<workerId>`); temp-unavailable `{ kind: 'tempUnavailable', workerId, reason, until, markedAt }` (doc id `tempunavail_<workerId>`)
 
 ---

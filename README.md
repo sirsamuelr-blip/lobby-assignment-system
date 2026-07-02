@@ -20,14 +20,22 @@ assigned what, when, and by whom.
 
 **It is not:** a system of record, an eligibility system, or an integration. It
 does not read or write EWMS/TIERS, does not make eligibility determinations, and
-does not store client case data. The link to EWMS is a single opaque case/ticket
-number the clerk types in — nothing more.
+does not store client case data. Its only tie to EWMS is the case number a clerk
+types into the copy-paste Teams message — which is handed to Teams and never
+stored by the app.
 
 ## Project status
 
-**Phase 0 — scaffold + Firebase connectivity check.** The app deploys and can
-read/write Firestore. **No assignment logic exists yet.** The full plan lives in
-[`BUILD-PHASES.md`](BUILD-PHASES.md) and the complete requirements in
+**Feature-complete (build phases 0–8).** Implemented and tested: the fairness
+engine and Assign flow; the pending / 10-minute-release concurrency guard;
+temp-unavailable with immediate re-suggest; the supervisor Admin page (roster
+plus single-day / date-range / recurring absences); manual override and
+reassign-with-count-correction; the Log and Reports / Balances tabs; and
+per-person Firebase Auth with **role-gating enforced at the data layer by
+Firestore Security Rules** — a clerk cannot reach or write admin data, even by
+crafting a direct request. The pure fairness/engine modules are covered by unit
+tests. The phased plan with a Definition of Done per phase is in
+[`BUILD-PHASES.md`](BUILD-PHASES.md); the full requirements are in
 [`lobby-assignment-system-spec.md`](lobby-assignment-system-spec.md).
 
 ## Stack
@@ -35,6 +43,8 @@ read/write Firestore. **No assignment logic exists yet.** The full plan lives in
 - [Vite](https://vite.dev/) + [React 19](https://react.dev/)
 - [Tailwind CSS v4](https://tailwindcss.com/) (via the `@tailwindcss/vite` plugin)
 - [Firebase 12](https://firebase.google.com/) — Firestore, Auth, Hosting
+- [Luxon](https://moment.github.io/luxon/) — DST-safe date math for the weekly window
+- [Vitest](https://vitest.dev/) — unit tests for the pure engine modules
 
 ## Stand up your own instance
 
@@ -105,30 +115,35 @@ at least 6 characters; the emails and names are optional and fall back to
 sensible defaults. No client PII is written — workers carry roster attributes
 only.
 
-> **Note:** The seed uses the Firebase **client** SDK, so it relies on
-> test-mode (open) Firestore rules. Phase 8 locks the rules down; after that,
-> re-seed via the Admin SDK or by temporarily relaxing the rules.
+> **Note:** The seed uses the Firebase **client** SDK against **open** Firestore
+> rules. The shipped rules are locked down (supervisor-gated writes), so seed a
+> **fresh** project before deploying the rules — or, on a project that already
+> has them, temporarily relax the rules or re-seed via the Admin SDK.
 
-### Connectivity check
+### First run
 
-With the dev server running, open the app and click **"Write test doc to
-Firestore."** On success it shows the new document's ID; on failure it shows the
-error message. The test writes a single `{ ok: true, at: <serverTimestamp> }`
-document to the `healthcheck` collection.
+With the dev server running, open the app — it opens to a **sign-in** screen.
+Log in with one of the seeded accounts (see *Seed test data* above): a clerk
+account sees the Assign / Roster / Log / Reports tabs; a supervisor account also
+sees the Admin tab.
 
-### Deploy (Firebase Hosting)
+### Deploy (Firebase Hosting + Firestore rules)
 
 ```bash
 # One-time login
 firebase login
 
-# Build, then deploy the contents of dist/
+# Build, then deploy hosting AND the Firestore security rules
 npm run build
 firebase deploy
 ```
 
-Hosting config lives in `firebase.json` (serves `dist/`, SPA rewrite of all
-routes to `/index.html`). The default project is set in `.firebaserc`.
+`firebase.json` configures both **Hosting** (serves `dist/`, SPA rewrite to
+`/index.html`) and **Firestore** (deploys `firestore.rules`). `firebase deploy`
+pushes both; `firebase deploy --only firestore:rules` updates just the rules.
+The target project is set in `.firebaserc` — **verify the `=== Deploying to
+'<project>'` line matches your project before confirming.** Deploy the rules
+before putting an instance in front of real staff.
 
 ## Documentation
 
